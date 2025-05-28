@@ -1,0 +1,236 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+import warnings
+warnings.filterwarnings('ignore')
+
+class CryptoTradingSystem:
+    def __init__(self, symbols=['SOL-USD', 'AAVE-USD', 'INJ-USD'], period='2y'):
+        self.symbols = symbols
+        self.period = period
+        self.results = {}
+        
+    def fetch_data(self, symbol):
+        """Download historical data"""
+        try:
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period=self.period, interval='1d')
+            if len(data) < 200:
+                return None
+            return data.fillna(method='ffill').dropna()
+        except Exception as e:
+            print(f"Error fetching {symbol}: {e}")
+            return None
+
+    def calculate_indicators(self, data):
+        """Calculate key technical indicators without TA-Lib"""
+        close = data['Close']
+        high = data['High']
+        low = data['Low']
+        volume = data['Volume']
+        
+        # Moving averages
+        data['SMA_20'] = close.rolling(window=20).mean()
+        data['EMA_12'] = close.ewm(span=12, adjust=False).mean()
+        data['EMA_26'] = close.ewm(span=26, adjust=False).mean()
+        
+        # RSI calculation
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        data['RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        data['MACD'] = data['EMA_12'] - data['EMA_26']
+        data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # Stochastic Oscillator
+        low14 = low.rolling(window=14).min()
+        high14 = high.rolling(window=14).max()
+        data['STOCH_K'] = 100 * (close - low14) / (high14 - low14)
+        data['STOCH_D'] = data['STOCH_K'].rolling(window=3).mean()
+        
+        # Average True Range (ATR)
+        prev_close = close.shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        data['ATR'] = tr.rolling(window=14).mean()
+        
+        # Bollinger Bands
+        sma20 = data['SMA_20']
+        std20 = close.rolling(window=20).std()
+        data['BB_Upper'] = sma20 + 2 * std20
+        data['BB_Lower'] = sma20 - 2 * std20
+        
+        # On Balance Volume (OBV)
+        direction = np.sign(close.diff()).fillna(0)
+        data['OBV'] = (volume * direction).cumsum()
+        
+        # Price features
+        data['Returns_5'] = close.pct_change(5)
+        data['Volatility_20'] = close.pct_change().rolling(20).std()
+        
+        return data
+
+    def create_target(self, data, forward_days=10, threshold=0.08):
+        """Create trading target"""
+        future_price = data['Close'].shift(-forward_days)
+        future_return = (future_price / data['Close']) - 1
+        
+        conditions = [future_return > threshold, future_return < -threshold]
+        data['Target'] = np.select(conditions, [1, -1], default=0)
+        return data
+
+    def prepare_features(self, data):
+        """Prepare ML features"""
+        feature_cols = [col for col in data.columns if col not in 
+                       ['Open', 'High', 'Low', 'Close', 'Volume', 'Target']]
+        
+        ml_data = data[feature_cols + ['Target']].copy()
+        ml_data = ml_data.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        if len(ml_data) < 100:
+            return None, None
+            
+        X = ml_data[feature_cols]
+        y = ml_data['Target']
+        
+        # Remove low variance features
+        valid_features = X.columns[X.var() > 0.001]
+        return X[valid_features], y
+
+    def train_models(self, X, y):
+        """Train ensemble models"""
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        models = {
+            'rf': RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42),
+            'gb': GradientBoostingClassifier(n_estimators=100, max_depth=6, random_state=42)
+        }
+        
+        results = {}
+        for name, model in models.items():
+            model.fit(X_train_scaled, y_train)
+            pred = model.predict(X_test_scaled)
+            accuracy = accuracy_score(y_test, pred)
+            cv_score = cross_val_score(model, X_train_scaled, y_train, cv=3).mean()
+            
+            results[name] = {
+                'model': model,
+                'accuracy': accuracy,
+                'cv_score': cv_score,
+                'scaler': scaler
+            }
+        
+        return results
+
+    def backtest(self, data, signals):
+        """Simple backtesting"""
+        capital = 10000.0
+        position = 0.0
+        trades = 0
+        returns = []
+        
+        for i, signal in enumerate(signals):
+            if i >= len(data):
+                break
+            price = data.iloc[i]['Close']
+            
+            if signal == 1 and position <= 0:  # Buy
+                position = capital / price * 0.9  # 10% commission
+                trades += 1
+            elif signal == -1 and position > 0:  # Sell
+                capital = position * price * 0.9
+                returns.append((capital - 10000) / 10000)
+                position = 0.0
+                trades += 1
+        
+        if len(returns) == 0:
+            return {'total_return': 0, 'num_trades': 0, 'win_rate': 0}
+            
+        total_return = returns[-1] * 100 if returns else 0
+        win_rate = len([r for r in returns if r > 0]) / len(returns) * 100
+        
+        return {
+            'total_return': total_return,
+            'num_trades': trades,
+            'win_rate': win_rate
+        }
+
+    def optimize_crypto(self, symbol):
+        """Optimize single crypto"""
+        print(f"\n🚀 Optimizing {symbol}")
+        
+        data = self.fetch_data(symbol)
+        if data is None:
+            return []
+            
+        data = self.calculate_indicators(data)
+        data = self.create_target(data)
+        
+        X, y = self.prepare_features(data)
+        if X is None:
+            return []
+            
+        model_results = self.train_models(X, y)
+        results = []
+        
+        for name, result in model_results.items():
+            model = result['model']
+            scaler = result['scaler']
+            X_scaled = scaler.transform(X)
+            signals = model.predict(X_scaled)
+            
+            backtest_results = self.backtest(data.dropna(), signals)
+            
+            final_result = {
+                'symbol': symbol,
+                'algorithm': name,
+                'accuracy': result['accuracy'],
+                'cv_score': result['cv_score'],
+                'total_return': backtest_results['total_return'],
+                'num_trades': backtest_results['num_trades'],
+                'win_rate': backtest_results['win_rate']
+            }
+            
+            results.append(final_result)
+            print(f"  {name}: Return: {final_result['total_return']:.1f}%, "
+                  f"Accuracy: {final_result['accuracy']:.3f}, "
+                  f"Win Rate: {final_result['win_rate']:.1f}%")
+        
+        return results
+
+    def run_optimization(self):
+        """Run optimization for all symbols"""
+        all_results = []
+        for symbol in self.symbols:
+            results = self.optimize_crypto(symbol)
+            all_results.extend(results)
+            self.results[symbol] = results
+        
+        # Show best results
+        if all_results:
+            best = max(all_results, key=lambda x: x['total_return'])
+            print(f"\n🏆 Best Result: {best['symbol']} - {best['algorithm']}")
+            print(f"   Return: {best['total_return']:.1f}%")
+            print(f"   Accuracy: {best['accuracy']:.3f}")
+            print(f"   Win Rate: {best['win_rate']:.1f}%")
+        
+        return all_results
+
+# Usage
+if __name__ == "__main__":
+    system = CryptoTradingSystem()
+    results = system.run_optimization()
